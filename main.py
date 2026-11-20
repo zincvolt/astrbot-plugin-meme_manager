@@ -1,0 +1,1430 @@
+import asyncio
+import base64
+import copy
+import re
+import sqlite3
+from pathlib import Path
+
+from mcp.types import CallToolResult, ImageContent, TextContent
+
+from astrbot.api import llm_tool, logger
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event.filter import EventMessageType
+from astrbot.api.provider import LLMResponse, ProviderRequest
+from astrbot.api.star import Context, Star
+
+from .astrbot_compat import (
+    ContextWrapper,
+    Message,
+    TextPart,
+    get_star_handlers_registry,
+)
+from .backend.auto_collect import AutoCollectManager
+from .backend.decision import DecisionClient
+from .backend.manual_collect import ManualCollectManager
+from .backend.packs.categories import CategoryManager
+from .backend.packs.images import IMAGE_EXTENSIONS
+from .backend.packs.preview import (
+    MAX_PREVIEW_IMAGES,
+    MAX_PREVIEW_PAGES,
+    PREVIEW_TOOL,
+    build_meme_preview,
+    discard_meme_tool_context,
+)
+from .backend.packs.resolver import get_pack_paths
+from .backend.semantic.index import EmbeddingAdapter, index_is_ready
+from .backend.semantic.models import runtime_category_mapping
+from .backend.semantic.query import (
+    candidate_records_multi_pack,
+    dumps_result,
+    remember_candidates,
+    search_memes_multi_pack,
+)
+from .backend.semantic.storage import load_metadata, semantic_metadata_is_complete
+from .backend.semantic.task import SemanticTaskManager
+from .config import (
+    DEFAULT_CATEGORY_DESCRIPTIONS,
+    PLUGIN_DATA_DIR,
+)
+from .image_host.img_sync import ImageSync
+from .mixins.commands import CommandMixin
+from .mixins.event_handlers import (
+    SEND_TOOL_PROMPT_MARKER_END,
+    SEND_TOOL_PROMPT_MARKER_START,
+    EventHandlerMixin,
+    normalize_trigger_scope,
+)
+from .mixins.integration import IntegrationMixin
+from .mixins.web_api import WebAPIMixin
+from .utils import dict_to_string, load_json
+
+# 指令自声明：/权限 列表 按插件分组展示用（插件开发规范要求，见 docs/PLUGIN-DEV.md）
+DECLARED_COMMANDS: dict[str, tuple[str, str]] = {
+    "/表情管理 查看图库": ("看表情包分类", "管理"),
+    "/表情管理 同步状态": ("查图床同步状态", "管理"),
+    "/表情管理 图库统计": ("图库详细统计", "管理"),
+    "/表情管理 添加分类": ("新增表情分类", "管理"),
+    "/表情管理 收集表情": ("收集引用图片", "管理"),
+    "/表情管理 开始收集": ("开始连续收集", "管理"),
+    "/表情管理 结束收集": ("结束连续收集", "管理"),
+    "/表情管理 添加表情": ("上传表情到分类", "管理"),
+    "/表情管理 恢复默认表情包": ("装回官方默认包", "管理"),
+    "/表情管理 清空指定类型": ("清空某分类表情", "管理"),
+    "/表情管理 清空全部": ("清空所有表情", "管理"),
+    "/表情管理 删除类型本身": ("删除分类及其表情", "管理"),
+    "/表情管理 同步到云端": ("推送本地到图床", "管理"),
+    "/表情管理 从云端同步": ("拉取图床到本地", "管理"),
+    "/表情管理 覆盖到云端": ("云端完全对齐本地", "管理"),
+    "/表情管理 从云端覆盖": ("本地完全对齐云端", "管理"),
+}
+
+MEME_PROMPT_MARKER_START = "<!-- meme_manager_prompt:start -->"
+MEME_PROMPT_MARKER_END = "<!-- meme_manager_prompt:end -->"
+SEMANTIC_PROMPT_MARKER_START = "<!-- meme_manager_semantic_prompt:start -->"
+SEMANTIC_PROMPT_MARKER_END = "<!-- meme_manager_semantic_prompt:end -->"
+PLUGIN_NAME = "meme_manager"
+WEBUI_LOG_PREFIX = f"[{PLUGIN_NAME}][WebUI]"
+
+
+class MemeSender(Star, WebAPIMixin, CommandMixin, EventHandlerMixin, IntegrationMixin):
+    def __init__(self, context: Context, config: dict = None):
+        super().__init__(context)
+        self._normalize_mixin_handler_module_paths()
+        self.config = config if config is not None else {}
+        schema = getattr(self.config, "schema", None)
+        if schema:
+            previous = copy.deepcopy(dict(self.config))
+            pending = [(self.config, schema)]
+            while pending:
+                current, items = pending.pop()
+                for key in tuple(current):
+                    if key not in items:
+                        del current[key]
+                        continue
+                    spec = items[key]
+                    if spec["type"] == "object" and isinstance(current[key], dict):
+                        pending.append((current[key], spec["items"]))
+                    elif spec.get("options") and current[key] not in spec["options"]:
+                        current[key] = copy.deepcopy(spec["default"])
+            if self.config != previous:
+                # 使用 AstrBot 的原子写入器保存仅包含配置结构的设置。
+                try:
+                    self.config.save_config()
+                except Exception:
+                    self.config.clear()
+                    self.config.update(previous)
+                    raise
+
+        # 只有执行语义操作时才需要模型。
+        self.semantic_enabled = bool(
+            self._read_config_value(
+                ("semantic", "enabled"),
+                default=False,
+            )
+        )
+        self.semantic_vision_provider_id = str(
+            self._read_config_value(
+                ("semantic", "vision_provider_id"),
+                default="",
+            )
+            or ""
+        )
+        self.semantic_embedding_provider_id = str(
+            self._read_config_value(
+                ("semantic", "embedding_provider_id"),
+                default="",
+            )
+            or ""
+        )
+        self.semantic_top_k = int(
+            self._read_config_value(("semantic", "top_k"), default=5) or 5
+        )
+        self.semantic_min_score = float(
+            self._read_config_value(("semantic", "min_score"), default=0.25)
+        )
+        self.semantic_task_manager = SemanticTaskManager(
+            PLUGIN_DATA_DIR,
+            context=context,
+            config={
+                "vision_provider_id": self.semantic_vision_provider_id,
+                "embedding_provider_id": self.semantic_embedding_provider_id,
+            },
+        )
+
+        # 初始化类别管理器
+        self.category_manager = CategoryManager()
+
+        # 图床初始化
+        self.img_sync = None
+        self.img_sync_config = None
+        self.img_sync_provider_type = None
+        self._img_sync_pack_id = ""
+        self._last_img_host_sync_task_status = None
+        self._img_host_sync_monitor = None
+        self._community_install_jobs = {}
+        self._community_install_tasks = set()
+        image_host_type = self._get_image_host_type()
+
+        if image_host_type == "stardots":
+            stardots_config = self._get_provider_config("stardots")
+            if stardots_config.get("key") and stardots_config.get("secret"):
+                stardots_config["provider"] = "stardots"
+                self.img_sync_config = {
+                    "key": stardots_config["key"],
+                    "secret": stardots_config["secret"],
+                    "space": stardots_config.get("space", "memes"),
+                    "provider": "stardots",
+                }
+                self.img_sync_provider_type = "stardots"
+        elif image_host_type == "cloudflare_r2":
+            r2_config = self._get_provider_config("cloudflare_r2")
+            required_fields = [
+                "account_id",
+                "access_key_id",
+                "secret_access_key",
+                "bucket_name",
+            ]
+            if all(r2_config.get(field) for field in required_fields):
+                if r2_config.get("public_url"):
+                    r2_config["public_url"] = r2_config["public_url"].rstrip("/")
+                r2_config["provider"] = "cloudflare_r2"
+                self.img_sync_config = dict(r2_config)
+                self.img_sync_provider_type = "cloudflare_r2"
+                self._r2_bucket_name = r2_config.get("bucket_name")
+        elif image_host_type == "lsky":
+            lsky_config = self._get_provider_config("lsky")
+            if lsky_config.get("url") and lsky_config.get("token"):
+                self.img_sync_config = dict(lsky_config)
+                self.img_sync_provider_type = "lsky"
+        elif image_host_type == "webdav":
+            webdav_config = self._get_provider_config("webdav")
+            required_fields = ["url", "username", "password"]
+            if all(webdav_config.get(field) for field in required_fields):
+                if webdav_config.get("url"):
+                    webdav_config["url"] = str(webdav_config["url"]).rstrip("/")
+                if webdav_config.get("public_url"):
+                    webdav_config["public_url"] = str(
+                        webdav_config["public_url"]
+                    ).rstrip("/")
+                webdav_config["provider"] = "webdav"
+                self.img_sync_config = dict(webdav_config)
+                self.img_sync_provider_type = "webdav"
+                self._webdav_url = webdav_config.get("url")
+            else:
+                missing_fields = [
+                    field for field in required_fields if not webdav_config.get(field)
+                ]
+                logger.warning(
+                    "WebDAV 图床未初始化，缺少必要配置项: %s。当前已读取字段: %s",
+                    ", ".join(missing_fields),
+                    ", ".join(sorted(webdav_config.keys())) or "无",
+                )
+
+        # 图床客户端按当前默认/目标表情包动态构建，避免固定绑定插件启动时目录。
+        if self.img_sync_config and self.img_sync_provider_type:
+            self._ensure_img_sync_for_pack()
+
+        # 上传与待发送状态
+        self.upload_states = {}
+        self.pending_images = {}
+        decision_config = self._read_path(("decision_service",), {})
+        self.decision_client = DecisionClient(
+            decision_config if isinstance(decision_config, dict) else {}
+        )
+        auto_collect_config = self._read_path(("auto_collect",), {})
+        self.auto_collect_manager = AutoCollectManager(
+            self,
+            {
+                **(
+                    auto_collect_config if isinstance(auto_collect_config, dict) else {}
+                ),
+                "auto_embedding": bool(
+                    self._read_path(("semantic", "auto_collect_embedding"), True)
+                ),
+            },
+        )
+        self.manual_collect_manager = ManualCollectManager(self.auto_collect_manager)
+
+        # 配置项
+        self.prompt_head = self._read_config_value(
+            ("generation", "prompt", "head"),
+            default="",
+        )
+        self.prompt_tail = self._read_config_value(
+            ("generation", "prompt", "tail"), default=""
+        )
+        self.prompt_examples = [
+            (
+                self._read_config_value(
+                    ("generation", "prompt", f"{name}_enabled"), default=False
+                ),
+                self._read_config_value(("generation", "prompt", name), default=""),
+            )
+            for name in ("category_example", "reply_example")
+        ]
+        self.max_memes_per_message = self._read_config_value(
+            ("generation", "emotion", "max_memes_per_message"), default=-1
+        )
+        self.emotions_probability = self._read_config_value(
+            ("generation", "emotion", "probability"),
+            default=100,
+        )
+        self.send_meme_tool_enabled = bool(
+            self._read_config_value(
+                ("generation", "emotion", "send_tool_enabled"), default=True
+            )
+        )
+        self.meme_tool_only = bool(
+            self._read_config_value(
+                ("generation", "emotion", "tool_only"), default=False
+            )
+        )
+        preview_images = self._read_config_value(
+            ("generation", "emotion", "preview_images_per_page"), default=9
+        )
+        self.preview_images_per_page = (
+            max(0, min(MAX_PREVIEW_IMAGES, preview_images))
+            if isinstance(preview_images, int)
+            else 9
+        )
+        self.keep_meme_send_summary = bool(
+            self._read_config_value(
+                ("generation", "emotion", "keep_send_summary"), default=True
+            )
+        )
+        self.tool_probability_enabled = bool(
+            self._read_config_value(
+                ("semantic", "tool_probability_enabled"), default=False
+            )
+        )
+        self.tool_call_probability = self._read_config_value(
+            ("semantic", "tool_call_probability"), default=100
+        )
+        self.emotion_llm_enabled = not self.meme_tool_only and self._read_config_value(
+            ("generation", "emotion", "llm", "enabled"),
+            default=False,
+        )
+        self.emotion_llm_provider_id = self._read_config_value(
+            ("generation", "emotion", "llm", "provider_id"),
+            default="",
+        )
+        self.selection_backend = str(
+            self._read_path(("generation", "emotion", "llm", "backend"), "chat")
+            or "chat"
+        )
+        self.semantic_query_source = str(
+            self._read_path(("semantic", "query", "source"), "generated") or "generated"
+        )
+        self.semantic_query_provider_id = str(
+            self._read_path(("semantic", "query", "provider_id"), "") or ""
+        ).strip()
+        emotion_llm_context_turns = self._read_config_value(
+            ("generation", "emotion", "llm", "context_turns"),
+            default=0,
+        )
+        try:
+            emotion_llm_context_turns = int(emotion_llm_context_turns)
+        except (TypeError, ValueError):
+            emotion_llm_context_turns = 0
+        self.emotion_llm_context_turns = max(0, min(20, emotion_llm_context_turns))
+        self.emotion_llm_inject_persona = bool(
+            self._read_config_value(
+                ("generation", "emotion", "llm", "inject_persona"),
+                default=False,
+            )
+        )
+        self.enable_mixed_message = self._read_config_value(
+            ("generation", "message", "enable_mixed"),
+            default=False,
+        )
+        self.mixed_message_probability = self._read_config_value(
+            ("generation", "message", "mixed_probability"),
+            default=50,
+        )
+        self.remove_invalid_alternative_markup = self._read_config_value(
+            ("generation", "markup", "remove_invalid_alternative"),
+            default=False,
+        )
+        self.filter_all_tags = self._read_config_value(
+            ("generation", "markup", "filter_all_tags"), default=False
+        )
+        self.convert_static_to_gif = self._read_config_value(
+            ("generation", "message", "convert_static_to_gif"),
+            default=False,
+        )
+        self.streaming_compatibility = self._read_config_value(
+            ("generation", "message", "streaming_compatibility"),
+            default=True,
+        )
+        self.send_image_as_base64 = self._read_config_value(
+            ("generation", "message", "send_image_as_base64"),
+            default=False,
+        )
+        self.content_cleanup_rule = self._read_config_value(
+            ("generation", "message", "content_cleanup_rule"),
+            default="&&[a-zA-Z]*&&",
+        )
+        # 表情附加触发范围：仅普通聊天 / 普通聊天及插件触发的 LLM
+        self.trigger_scope = normalize_trigger_scope(
+            self._read_config_value(
+                ("generation", "trigger", "scope"),
+                default="only_chat_llm",
+            )
+        )
+
+        # 构建表情包提示词
+        self.sys_prompt_add = ""
+        self.persona_base_prompts = {}
+        self._reload_personas()
+
+        # 注册 WebUI API
+        self._register_web_apis()
+
+        self._semantic_initial_rebuild_task = None
+
+    async def initialize(self) -> None:
+        """重载时启动收集，初次启动时延后处理尚未注册的提供方。"""
+        await self.auto_collect_manager.start(defer_missing_provider=True)
+
+    @filter.on_astrbot_loaded()
+    async def _schedule_semantic_initial_rebuild(self):
+        """等 AstrBot 核心和所有 Provider 加载完成后再安排首次静默重建。"""
+        await self.auto_collect_manager.start()
+        if not self.semantic_enabled:
+            return
+        task = self._semantic_initial_rebuild_task
+        if task and not task.done():
+            return
+        self._semantic_initial_rebuild_task = asyncio.create_task(
+            self._auto_rebuild_initial_pack()
+        )
+
+    @classmethod
+    def _normalize_mixin_handler_module_paths(cls):
+        """兼容尚未原生支持 Mixin 指令处理器的 AstrBot 版本。"""
+        try:
+            star_handlers_registry = get_star_handlers_registry()
+        except (ImportError, AttributeError):
+            return
+
+        plugin_package = cls.__module__.rsplit(".", 1)[0]
+        mixin_module_prefix = f"{plugin_package}.mixins."
+        adjusted_count = 0
+        for handler_metadata in star_handlers_registry:
+            if not handler_metadata.handler_module_path.startswith(
+                mixin_module_prefix,
+            ):
+                continue
+            handler_metadata.handler_module_path = cls.__module__
+            adjusted_count += 1
+
+        if adjusted_count:
+            logger.info(f"已将 {adjusted_count} 个 Mixin 指令处理器绑定到插件主模块。")
+
+    @filter.event_message_type(EventMessageType.ALL)
+    async def handle_upload_image(self, event: AstrMessageEvent):
+        manual_manager = getattr(self, "manual_collect_manager", None)
+        if manual_manager is not None:
+            response = await manual_manager.consume(event)
+            if response is not None:
+                if response:
+                    yield event.plain_result(response)
+                return
+        user_key = f"{event.session_id}_{event.get_sender_id()}"
+        manual_upload_pending = user_key in self.upload_states
+        async for result in self._handle_upload_image_impl(event):
+            yield result
+        if not manual_upload_pending:
+            await self.auto_collect_manager.submit(event)
+
+    @filter.on_waiting_llm_request(priority=99999)
+    async def mark_llm_request_origin(self, event: AstrMessageEvent):
+        return await self._mark_llm_request_origin_impl(event)
+
+    @filter.on_llm_request(priority=99999)
+    async def inject_meme_prompt(self, event: AstrMessageEvent, req: ProviderRequest):
+        return await self._inject_meme_prompt_impl(event, req)
+
+    @filter.on_llm_response(priority=99999)
+    async def resp(self, event: AstrMessageEvent, response: LLMResponse):
+        return await self._resp_impl(event, response)
+
+    @filter.on_agent_begin(priority=99999)
+    async def track_meme_tool_context(
+        self, event: AstrMessageEvent, run_context: ContextWrapper
+    ):
+        """Keep access to the current agent messages while meme tools run.
+
+        Args:
+            event: Message event for this agent turn.
+            run_context: Agent context whose message list can change between steps.
+        """
+        if event.get_extra("meme_manager_request_initialized"):
+            event.set_extra("meme_manager_tool_context", run_context)
+
+    @filter.on_agent_done(priority=99999)
+    async def compact_meme_tool_history(
+        self,
+        event: AstrMessageEvent,
+        run_context: ContextWrapper,
+        response: LLMResponse,
+    ):
+        """Keep at most one delivery summary before AstrBot saves the turn.
+
+        Args:
+            event: Message event for the completed turn.
+            run_context: Agent context about to be saved.
+            response: Final response supplied by the AstrBot hook.
+        """
+        if event.get_extra("meme_manager_tool_context") is not run_context:
+            return
+        event.set_extra("meme_manager_tool_context", None)
+        event.set_extra("meme_manager_preview_candidates", None)
+        receipt = event.get_extra("meme_manager_send_summary")
+        event.set_extra("meme_manager_send_summary", None)
+        messages = run_context.messages
+        discard_meme_tool_context(messages)
+        if receipt is None or not self.keep_meme_send_summary:
+            return
+
+        count, category, number = receipt
+        detail = ""
+        if count == 1:
+            category = " ".join(category.split())[:32]
+            detail = f"（{category}，#{number}）" if number else f"（{category}）"
+        summary = f"已发送 {count} 张表情{detail}。"
+        last = messages[-1] if messages else None
+        if (
+            last
+            and last.role == "assistant"
+            and not last.tool_calls
+            and not last._no_save
+        ):
+            content = last.content
+            if isinstance(content, list):
+                content = [
+                    *content,
+                    TextPart(text=f"\n\n{summary}" if content else summary),
+                ]
+            else:
+                content = f"{content}\n\n{summary}" if content else summary
+            messages[-1] = last.model_copy(update={"content": content})
+        else:
+            messages.append(Message(role="assistant", content=summary))
+
+    @filter.on_decorating_result(priority=99999)
+    async def on_decorating_result(self, event: AstrMessageEvent):
+        return await self._on_decorating_result_impl(event)
+
+    @filter.after_message_sent()
+    async def after_message_sent(self, event: AstrMessageEvent):
+        return await self._after_message_sent_impl(event)
+
+    def _get_image_host_type(self) -> str:
+        image_host = self._read_config_value(
+            ("storage", "provider"),
+            default="stardots",
+        )
+        return str(image_host or "stardots").strip().lower()
+
+    def _read_path(self, path: tuple[str, ...], missing=None):
+        current = self.config
+        for key in path:
+            if not isinstance(current, dict) or key not in current:
+                return missing
+            current = current[key]
+        return current
+
+    def _read_config_value(
+        self,
+        primary_path: tuple[str, ...],
+        default=None,
+    ):
+        value = self._read_path(primary_path)
+        return default if value is None else value
+
+    def _get_provider_config(self, provider_key: str) -> dict:
+        provider_config = self._read_path(("storage", "providers", provider_key), {})
+        return dict(provider_config) if isinstance(provider_config, dict) else {}
+
+    def _resolve_sync_pack_target(self, preferred_pack_id: str | None = None):
+        from .backend.packs.resolver import get_pack_paths, resolve_pack_id
+
+        pack_id = str(preferred_pack_id or "").strip()
+        if pack_id:
+            paths = get_pack_paths(pack_id)
+            pack_dir = paths["pack_dir"]
+            if pack_dir.is_dir():
+                memes_dir = paths["memes_dir"]
+                memes_dir.mkdir(parents=True, exist_ok=True)
+                return pack_id, memes_dir
+
+        resolved_pack_id = resolve_pack_id()
+        paths = get_pack_paths(resolved_pack_id)
+        memes_dir = paths["memes_dir"]
+        memes_dir.mkdir(parents=True, exist_ok=True)
+        return resolved_pack_id, memes_dir
+
+    def _ensure_img_sync_for_pack(self, preferred_pack_id: str | None = None):
+        if not (self.img_sync_config and self.img_sync_provider_type):
+            return None
+
+        target_pack_id, target_memes_dir = self._resolve_sync_pack_target(
+            preferred_pack_id
+        )
+        running_process = (
+            getattr(self.img_sync, "sync_process", None) if self.img_sync else None
+        )
+        if running_process and running_process.is_alive():
+            if target_memes_dir.resolve() != Path(self.img_sync.local_dir).resolve():
+                raise RuntimeError("已有同步任务正在运行，请等待完成后再切换同步表情包")
+            return self.img_sync
+
+        current_dir = None
+        if self.img_sync and getattr(self.img_sync, "local_dir", None):
+            try:
+                current_dir = Path(self.img_sync.local_dir).resolve()
+            except Exception:
+                current_dir = None
+
+        if current_dir != target_memes_dir.resolve():
+            # 构建适配器时仅验证配置，不发起网络探测。
+            try:
+                previous_sync = self.img_sync
+                self.img_sync = ImageSync(
+                    config=self.img_sync_config,
+                    local_dir=target_memes_dir,
+                    provider_type=self.img_sync_provider_type,
+                )
+                if previous_sync:
+                    previous_sync.close()
+            except Exception as exc:
+                logger.error(
+                    "图床 %s 初始化失败，无法同步：%s",
+                    self.img_sync_provider_type,
+                    exc,
+                )
+                self.img_sync = None
+                return None
+
+        self._img_sync_pack_id = target_pack_id
+        return self.img_sync
+
+    def _build_meme_prompt(self, category_mapping_string: str | None = None) -> str:
+        """组合分类指令、示例及可选的数量指引。
+
+        Args:
+            category_mapping_string: 当前请求可用的分类。
+
+        Returns:
+            分类指令及已启用且非空的附加内容。
+        """
+        mapping_string = category_mapping_string or self.category_mapping_string
+        prompt = self.prompt_head + mapping_string + self.prompt_tail
+        for enabled, template in getattr(self, "prompt_examples", []):
+            if enabled and template.strip():
+                prompt += "\n\n" + template.strip()
+        return prompt + self._build_meme_quantity_prompt()
+
+    def _build_meme_quantity_prompt(self) -> str:
+        """构建所有表情选图提示共用的可选数量指引。
+
+        Returns:
+            可编辑的数量指引；禁用或留空时返回空字符串。
+        """
+        if not self._read_config_value(
+            ("generation", "prompt", "quantity_guidance_enabled"), default=False
+        ):
+            return ""
+        template = self._read_config_value(
+            ("generation", "prompt", "quantity_guidance"), default=""
+        ).strip()
+        if not template:
+            return ""
+        return "\n\n" + template + "\n"
+
+    def _resolve_embedding_provider(self, pack_id: str = ""):
+        return self.semantic_task_manager._resolve_embedding_provider(pack_id)
+
+    async def _auto_rebuild_initial_pack(self):
+        """语义开关已开启时，后台静默补齐当前包的本机向量索引。"""
+        await asyncio.sleep(3)
+        try:
+            pack_context = self._resolve_runtime_pack_context()
+            pack_id = str(pack_context.get("pack_id") or "").strip()
+            pack_dir = pack_context.get("pack_dir")
+            if not pack_id or not pack_dir:
+                logger.info(
+                    "%s 语义检索已开启，但当前没有可重建的表情包。", WEBUI_LOG_PREFIX
+                )
+                return
+            metadata = load_metadata(pack_dir)
+            images = metadata.get("images", {})
+            caption_done = sum(
+                1
+                for item in images.values()
+                if isinstance(item, dict) and item.get("caption_status") == "done"
+            )
+            if (
+                not images
+                or caption_done != len(images)
+                or not semantic_metadata_is_complete(pack_dir, metadata)
+            ):
+                logger.info(
+                    "%s 首次开启语义检索：%s 的图片描述尚未全部完成，暂不自动建立向量；"
+                    "请先在语义化页面完成描述。",
+                    WEBUI_LOG_PREFIX,
+                    pack_id,
+                )
+                return
+            embedding = self.semantic_task_manager._require_embedding_provider(
+                pack_id, "首次建立语义索引"
+            )
+            if index_is_ready(
+                PLUGIN_DATA_DIR,
+                pack_id,
+                metadata,
+                embedding.provider_id,
+                embedding.model_name,
+                embedding.dimension,
+            ):
+                return
+            logger.info(
+                "%s 首次开启语义检索：后台静默重建 %s 的向量索引（Provider=%s，维度=%s）。",
+                WEBUI_LOG_PREFIX,
+                pack_id,
+                embedding.provider_id,
+                embedding.dimension,
+            )
+            result = await self.semantic_task_manager.rebuild_index(pack_id, force=True)
+            logger.info(
+                "%s 首次开启语义检索：%s 向量索引完成，共 %s 条。",
+                WEBUI_LOG_PREFIX,
+                pack_id,
+                result.get("item_count", 0),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "%s 首次开启语义检索的后台向量重建未完成：%s",
+                WEBUI_LOG_PREFIX,
+                str(exc),
+            )
+
+    def _reply_model_supports_tools(
+        self, event: AstrMessageEvent | None, *, require_image_input: bool = False
+    ) -> bool:
+        """Check tool support using the reply provider's declared modalities.
+
+        Args:
+            event: Message event with the selected reply provider, if available.
+            require_image_input: Require explicit support for image input as well.
+
+        Returns:
+            Whether the provider supports the required modalities.
+        """
+        if event is None:
+            return not require_image_input
+        try:
+            selected = event.get_extra("selected_provider")
+            provider = (
+                self.context.get_provider_by_id(selected)
+                if isinstance(selected, str) and selected
+                else self.context.get_using_provider(event.unified_msg_origin)
+            )
+            provider_config = getattr(provider, "provider_config", {})
+            modalities = (
+                provider_config.get("modalities")
+                if isinstance(provider_config, dict)
+                else None
+            )
+            if not isinstance(modalities, list) or not modalities:
+                return not require_image_input
+            available = {str(modality or "").strip().lower() for modality in modalities}
+            return "tool_use" in available and (
+                not require_image_input or "image" in available
+            )
+        except Exception:
+            return not require_image_input
+
+    def _semantic_pack_ready(
+        self,
+        event: AstrMessageEvent | None = None,
+        req: ProviderRequest | None = None,
+        *,
+        require_tool: bool = False,
+        for_direct_search: bool = False,
+    ) -> bool:
+        """判断当前选择的运行时表情包能否使用语义检索。
+
+        检查全部绑定的表情包；至少一个表情包索引完整即视为就绪。
+
+        Args:
+            event: 当前 AstrBot 消息事件。
+            req: 检查请求阶段工具时的当前模型请求。
+            require_tool: 是否要求回复模型和请求公开语义检索工具。
+            for_direct_search: Check existing indexes even in category selection mode.
+
+        Returns:
+            任一绑定表情包的有效向量与其向量模型匹配时返回 True。
+        """
+        if not for_direct_search and not self.semantic_enabled:
+            return False
+        if (
+            require_tool
+            and req is not None
+            and not self._reply_model_supports_tools(event)
+        ):
+            return False
+        if require_tool and req is not None:
+            tool_set = getattr(req, "func_tool", None)
+            if (
+                tool_set is None
+                or not callable(getattr(tool_set, "get_tool", None))
+                or not tool_set.get_tool("search_memes")
+            ):
+                return False
+
+        context = self._resolve_runtime_pack_context(event=event, req=req)
+        pack_ids = context.get("pack_ids", [])
+        if not pack_ids:
+            return False
+
+        # 损坏的表情包不能使同一绑定中的正常表情包失效。
+        for pack_id in pack_ids:
+            try:
+                pack_dir = get_pack_paths(pack_id)["pack_dir"]
+                metadata = load_metadata(pack_dir)
+                if not metadata.get("images"):
+                    continue
+                provider = self._resolve_embedding_provider(pack_id)
+                embedding = EmbeddingAdapter(
+                    provider, self.semantic_embedding_provider_id or ""
+                )
+                if embedding.ready and index_is_ready(
+                    PLUGIN_DATA_DIR,
+                    pack_id,
+                    metadata,
+                    embedding.provider_id,
+                    embedding.model_name,
+                    embedding.dimension,
+                    allow_partial=True,
+                ):
+                    return True
+            except Exception as exc:
+                logger.warning("表情包 %s 的语义检查失败：%s", pack_id, exc)
+
+        return False
+
+    @staticmethod
+    def _remove_meme_tool(req: ProviderRequest, name: str = "search_memes") -> None:
+        """从当前请求移除表情工具，不修改共享工具。
+
+        Args:
+            req: 当前提供方请求。
+            name: 待移除的工具名称，保留其他工具及权限。
+        """
+        tool_set = getattr(req, "func_tool", None)
+        get_full_tool_set = getattr(tool_set, "get_full_tool_set", None)
+        if callable(get_full_tool_set):
+            req.func_tool = get_full_tool_set()
+            tool_set = req.func_tool
+        elif tool_set is not None:
+            # ToolSet 实例可能与其他事件或注册表共享。
+            req.func_tool = copy.copy(tool_set)
+            if hasattr(tool_set, "tools"):
+                req.func_tool.tools = list(tool_set.tools)
+            tool_set = req.func_tool
+        remove_tool = getattr(tool_set, "remove_tool", None)
+        if callable(remove_tool):
+            remove_tool(name)
+
+    def _semantic_mode_active(
+        self, event: AstrMessageEvent | None, *, include_direct: bool = False
+    ) -> bool:
+        """Check whether the event still uses the verified semantic packs.
+
+        Args:
+            event: Current message event with the resolved pack binding.
+            include_direct: Whether to allow semantic search used only by send_meme.
+
+        Returns:
+            True if the requested semantic mode and pack binding are still valid.
+        """
+        if event is None or not hasattr(event, "get_extra"):
+            return False
+        verified_ids = str(
+            event.get_extra("meme_manager_semantic_verified_pack_ids") or ""
+        )
+        runtime_pack_ids = event.get_extra("meme_manager_runtime_pack_ids") or []
+        runtime_ids_str = ",".join(runtime_pack_ids)
+        return (
+            bool(event.get_extra("meme_manager_semantic_active"))
+            and bool(verified_ids)
+            and verified_ids == runtime_ids_str
+            and (
+                include_direct
+                or event.get_extra("meme_manager_semantic_mode") != "direct"
+            )
+        )
+
+    def _semantic_system_prompt(self, search_result: str | None = None) -> str:
+        """描述如何从实时搜索或预取候选中选择可选图片。
+
+        Args:
+            search_result: 独立尝试结束后的序列化结果。
+
+        Returns:
+            可移除的系统提示区块，包含选择与隐私规则。
+        """
+        if search_result is not None:
+            return (
+                f"\n\n{SEMANTIC_PROMPT_MARKER_START}\n"
+                "[本轮表情检索已结束]\n"
+                "本轮搜索已完成。以下 JSON 是本轮检索结果。"
+                "可从本轮候选中选择符合回复意图的图片，也可以继续纯文字回复。"
+                "保持当前人格、语气和对话目标，遵循用户对内容和格式的要求。"
+                "也可以使用已知的、当前表情包内的图片 ID。"
+                "使用回复标签时，将图片 ID 包在 && 中，每个标记独占一行，"
+                "有正文时放在末尾。回复标签由插件在处理回复时转换为图片发送请求。"
+                "候选 ID 用于选图和发送，描述及标签作为选图参考数据。"
+                "面向用户的回复围绕对话内容自然表达。"
+                "涉及图片细节时，以已有图片资料和用户说明为依据。\n"
+                + self._build_meme_quantity_prompt()
+                + search_result
+                + f"\n{SEMANTIC_PROMPT_MARKER_END}"
+            )
+        return (
+            f"\n\n{SEMANTIC_PROMPT_MARKER_START}\n"
+            "[表情图片表达]\n"
+            "根据当前对话和回复意图决定是否配图，可以纯文字、图文结合，也可以只回复表情。"
+            "保持当前人格、语气和对话目标，遵循用户对内容和格式的要求。\n"
+            "[选图流程]\n"
+            "如果已知当前表情包内的图片 ID，可以直接使用。"
+            "需要查找图片时，调用 search_memes，本轮最多搜索一次。"
+            "query 简短描述准备表达的态度、情绪或动作，并说明表达对象。"
+            "检索后从本轮候选中选择贴切的图片；也可以继续纯文字回复。\n"
+            "[发送方式]\n"
+            "使用回复标签时，将图片 ID 包在 && 中，每个标记独占一行，"
+            "有正文时放在末尾。回复标签由插件在处理回复时转换为图片发送请求。\n"
+            "[候选资料]\n"
+            "候选 ID 用于选图和发送，描述及标签作为选图参考数据。"
+            "面向用户的回复围绕对话内容自然表达。"
+            "涉及图片细节时，以已有图片资料和用户说明为依据。\n"
+            f"{self._build_meme_quantity_prompt()}"
+            f"{SEMANTIC_PROMPT_MARKER_END}"
+        )
+
+    def _wrap_meme_prompt(self, prompt: str) -> str:
+        return f"\n\n{MEME_PROMPT_MARKER_START}\n{prompt}\n{MEME_PROMPT_MARKER_END}"
+
+    def _strip_meme_prompt(self, prompt: str | None) -> str:
+        prompt = prompt or ""
+        for start, end in (
+            (MEME_PROMPT_MARKER_START, MEME_PROMPT_MARKER_END),
+            (SEMANTIC_PROMPT_MARKER_START, SEMANTIC_PROMPT_MARKER_END),
+            (SEND_TOOL_PROMPT_MARKER_START, SEND_TOOL_PROMPT_MARKER_END),
+        ):
+            prompt = re.sub(
+                rf"(?:\n\n)?{re.escape(start)}[\s\S]*?{re.escape(end)}",
+                "",
+                prompt,
+            )
+        return prompt
+
+    def _resolve_persona_id(
+        self, event: AstrMessageEvent | None = None, req: ProviderRequest | None = None
+    ) -> str | None:
+        """读取选包前已缓存的实际生效人格。
+
+        Args:
+            event: 携带本次请求已解析人格的消息事件。
+            req: 尚无已解析人格时使用的提供方请求。
+
+        Returns:
+            实际生效的人格 ID；未选择人格时返回 None。
+        """
+        if event is not None and hasattr(event, "get_extra"):
+            resolved_persona = event.get_extra("meme_manager_resolved_persona_id")
+            if resolved_persona is not None:
+                return str(resolved_persona).strip() or None
+        if req and req.conversation:
+            persona_id = str(getattr(req.conversation, "persona_id", "") or "").strip()
+            if persona_id:
+                return persona_id
+        if event is None:
+            return None
+        persona_id = str(getattr(event, "persona_id", "") or "").strip()
+        if persona_id:
+            return persona_id
+        if hasattr(event, "get_extra"):
+            persona_id = str(event.get_extra("persona_id") or "").strip()
+            if persona_id:
+                return persona_id
+        return None
+
+    def _resolve_runtime_pack_context(
+        self, event: AstrMessageEvent | None = None, req: ProviderRequest | None = None
+    ) -> dict:
+        from .backend.packs.resolver import resolve_pack_context
+
+        session_id = ""
+        if req:
+            session_id = str(req.session_id or "").strip()
+        if not session_id and event is not None:
+            session_id = str(getattr(event, "session_id", "") or "").strip()
+        persona_id = self._resolve_persona_id(event=event, req=req)
+        context = resolve_pack_context(
+            session_id=session_id or None, persona_id=persona_id
+        )
+        if event is not None and hasattr(event, "set_extra"):
+            event.set_extra(
+                "meme_manager_runtime_memes_dir",
+                str(context["memes_dir"]),
+            )
+            # 同时保存用于向后兼容的单个 pack_id 与 pack_ids 列表。
+            pack_ids = context.get("pack_ids", [])
+            event.set_extra(
+                "meme_manager_runtime_pack_id", str(context.get("pack_id") or "")
+            )
+            event.set_extra("meme_manager_runtime_pack_ids", pack_ids)
+        return context
+
+    def _get_runtime_memes_dir_for_event(self, event: AstrMessageEvent):
+        if hasattr(event, "get_extra"):
+            runtime_memes_dir = str(
+                event.get_extra("meme_manager_runtime_memes_dir") or ""
+            ).strip()
+            if runtime_memes_dir:
+                return runtime_memes_dir
+        return str(self._resolve_runtime_pack_context(event=event)["memes_dir"])
+
+    def _get_manageable_categories(self) -> set[str]:
+        return (
+            set(self.category_manager.get_descriptions())
+            | self.category_manager.get_local_categories()
+        )
+
+    def _ensure_default_category_descriptions(self, categories: list[str]) -> None:
+        existing_descriptions = self.category_manager.get_descriptions()
+        updated = False
+        for category in categories:
+            if category in existing_descriptions:
+                continue
+            default_description = DEFAULT_CATEGORY_DESCRIPTIONS.get(category)
+            if not default_description:
+                continue
+            if self.category_manager.update_description(category, default_description):
+                existing_descriptions[category] = default_description
+                updated = True
+        if updated:
+            self._reload_personas()
+
+    def _get_persona_key(self, persona: dict, index: int) -> str:
+        return str(persona.get("name") or persona.get("id") or index)
+
+    def _sync_persona_base_prompts(self, personas: list[dict]) -> None:
+        active_keys = set()
+        for index, persona in enumerate(personas):
+            key = self._get_persona_key(persona, index)
+            active_keys.add(key)
+            self.persona_base_prompts[key] = self._strip_meme_prompt(
+                persona.get("prompt", "")
+            )
+        for key in set(self.persona_base_prompts) - active_keys:
+            del self.persona_base_prompts[key]
+
+    def _apply_persona_prompts(self) -> None:
+        personas = self.context.provider_manager.personas
+        self._sync_persona_base_prompts(personas)
+        self.sys_prompt_add = ""
+        for index, persona in enumerate(personas):
+            key = self._get_persona_key(persona, index)
+            persona["prompt"] = self.persona_base_prompts[key]
+
+    def _apply_request_prompt(
+        self, req: ProviderRequest, event: AstrMessageEvent | None = None
+    ) -> None:
+        semantic_mode = ""
+        supports_tools = self._reply_model_supports_tools(event)
+        tool_only = getattr(self, "meme_tool_only", False)
+        tool_only_fallback = tool_only and not supports_tools
+        semantic_selection = getattr(self, "semantic_enabled", True)
+        get_tool = getattr(getattr(req, "func_tool", None), "get_tool", None)
+        send_tool = get_tool("send_meme") if callable(get_tool) else None
+        search_tool = get_tool("search_memes") if callable(get_tool) else None
+        direct_tools_available = bool(
+            getattr(self, "send_meme_tool_enabled", True)
+            and send_tool
+            and getattr(send_tool, "active", True)
+            and search_tool
+            and getattr(search_tool, "active", True)
+            and supports_tools
+        )
+        initialized = event is not None and event.get_extra(
+            "meme_manager_request_initialized"
+        )
+        mode_changed = initialized and (
+            self.emotion_llm_enabled
+            != (event.get_extra("meme_manager_selection_timing") == "after_reply")
+            or tool_only_fallback
+            != bool(event.get_extra("meme_manager_tool_only_fallback"))
+        )
+        if tool_only_fallback:
+            if not initialized or mode_changed:
+                logger.info(
+                    "[meme_manager] Reply model lacks tool support; using category tags."
+                )
+        elif tool_only or not semantic_selection:
+            if direct_tools_available and self._semantic_pack_ready(
+                event=event, req=req, for_direct_search=True
+            ):
+                semantic_mode = "direct"
+        elif semantic_selection and self.emotion_llm_enabled:
+            if self._semantic_pack_ready(event=event, req=req):
+                semantic_mode = "llm"
+        elif semantic_selection:
+            if self._semantic_pack_ready(
+                event=event,
+                req=req,
+                require_tool=not getattr(self, "tool_probability_enabled", False),
+            ):
+                semantic_mode = "tool"
+        if initialized and not mode_changed:
+            semantic_mode = str(event.get_extra("meme_manager_semantic_mode") or "")
+        semantic_active = bool(semantic_mode)
+        if (
+            event is not None
+            and hasattr(event, "set_extra")
+            and (not initialized or mode_changed)
+        ):
+            event.set_extra("meme_manager_request_initialized", True)
+            event.set_extra("meme_manager_tool_only_fallback", tool_only_fallback)
+            event.set_extra("meme_manager_semantic_active", semantic_active)
+            event.set_extra("meme_manager_semantic_mode", semantic_mode)
+            # 保存已验证的表情包 ID，供后续校验。
+            runtime_pack_ids = event.get_extra("meme_manager_runtime_pack_ids") or []
+            event.set_extra(
+                "meme_manager_semantic_verified_pack_ids",
+                ",".join(runtime_pack_ids) if semantic_active else "",
+            )
+            if not initialized:
+                event.set_extra("meme_manager_semantic_selected_ids", [])
+                event.set_extra("meme_manager_semantic_candidates", {})
+                event.set_extra("meme_manager_semantic_query", "")
+                event.set_extra("meme_manager_semantic_search_completed", False)
+                event.set_extra("meme_manager_semantic_response_processed", False)
+                event.set_extra("meme_manager_image_only_reply", False)
+                event.set_extra("meme_manager_stream_filtered", False)
+                event.set_extra("meme_manager_reply_provider_id", "")
+                event.set_extra("meme_manager_reply_model", "")
+            event.set_extra(
+                "meme_manager_selection_backend",
+                getattr(self, "selection_backend", "chat"),
+            )
+            event.set_extra(
+                "meme_manager_selection_timing",
+                "after_reply" if self.emotion_llm_enabled else "during_reply",
+            )
+            event.set_extra(
+                "meme_manager_selection_method",
+                "semantic" if semantic_mode in {"tool", "llm"} else "category",
+            )
+        if semantic_mode == "tool":
+            req.system_prompt = self._strip_meme_prompt(
+                req.system_prompt
+            ) + self._semantic_system_prompt(
+                event.get_extra("meme_manager_tool_probability_result")
+                if event is not None
+                else None
+            )
+            return
+        direct_search = semantic_mode == "llm" and direct_tools_available
+        if not direct_search and semantic_mode != "direct":
+            self._remove_meme_tool(req)
+        if (
+            (tool_only and not tool_only_fallback)
+            or semantic_mode == "llm"
+            or self.emotion_llm_enabled
+        ):
+            req.system_prompt = self._strip_meme_prompt(req.system_prompt)
+            return
+        pack_context = self._resolve_runtime_pack_context(event=event, req=req)
+        context_mapping = pack_context.get("category_mapping")
+        category_mapping = (
+            runtime_category_mapping(context_mapping)
+            if isinstance(context_mapping, dict)
+            else runtime_category_mapping(self.category_mapping)
+        )
+        # 首次安装时即使没有可用图片，也可能已有分类描述。
+        memes_dirs = [
+            Path(directory) / "memes"
+            for directory in pack_context.get("pack_dirs", {}).values()
+        ] or [Path(pack_context["memes_dir"])]
+        category_mapping = {
+            key: description
+            for key, description in category_mapping.items()
+            if any(
+                (memes_dir / key).is_dir()
+                and any(
+                    image.is_file() and image.suffix.lower() in IMAGE_EXTENSIONS
+                    for image in (memes_dir / key).iterdir()
+                )
+                for memes_dir in memes_dirs
+            )
+        }
+        req.system_prompt = self._strip_meme_prompt(req.system_prompt)
+        if not category_mapping:
+            return
+        category_mapping_string = dict_to_string(category_mapping)
+        sys_prompt_add = self._build_meme_prompt(category_mapping_string)
+        req.system_prompt = self._strip_meme_prompt(
+            req.system_prompt
+        ) + self._wrap_meme_prompt(sys_prompt_add)
+
+    def _reload_personas(self):
+        pack_context = self._resolve_runtime_pack_context()
+        context_mapping = pack_context.get("category_mapping")
+        self.category_mapping = runtime_category_mapping(
+            context_mapping
+            if isinstance(context_mapping, dict)
+            else load_json(pack_context["metadata_path"], DEFAULT_CATEGORY_DESCRIPTIONS)
+        )
+        self.category_mapping_string = dict_to_string(self.category_mapping)
+        self._apply_persona_prompts()
+
+    async def reload_emotions(self):
+        try:
+            await asyncio.to_thread(self.category_manager.sync_with_filesystem)
+            self._reload_personas()
+        except Exception as e:
+            logger.error(f"重新加载表情配置失败: {str(e)}")
+
+    @llm_tool(name="search_memes")
+    async def search_memes_tool(self, event: AstrMessageEvent, query: str) -> str:
+        """查找符合助手表达意图的表情图片。
+
+        使用简短的自然语言描述想表达的情绪、态度或
+        动作，并说明其指代对象。每条回复最多搜索一次。
+        返回的候选图片可供本轮选择。
+
+        Args:
+            query(string): 想表达的含义，例如庆祝某人
+                取得成就，或带着玩笑意味表达失望。
+
+        Returns:
+            包含候选 ID、描述和标签的 JSON 搜索结果。
+            使用完整候选 ID 选择具体图片，
+            再通过可用的发送方式完成投递。
+        """
+        direct_search = bool(
+            event.get_extra("meme_manager_send_tool_available")
+            and getattr(self, "send_meme_tool_enabled", True)
+            and event.get_extra("meme_manager_direct_search_available")
+        )
+        if (
+            event.get_extra("meme_manager_tool_probability_enabled")
+            and not event.get_extra("meme_manager_tool_probability_running")
+            and not direct_search
+        ):
+            return dumps_result({"ok": False, "reason": "tool_probability_managed"})
+        if not self._semantic_mode_active(event, include_direct=True) or (
+            str(event.get_extra("meme_manager_semantic_mode") or "") != "tool"
+            and not direct_search
+        ):
+            return dumps_result({"ok": False, "reason": "语义查询未启用或索引不可用"})
+        if bool(event.get_extra("meme_manager_semantic_search_completed")):
+            return dumps_result(
+                {
+                    "ok": False,
+                    "reason": "本轮已经完成唯一一次搜索，请直接根据上次候选完成最终回复",
+                }
+            )
+        event.set_extra("meme_manager_semantic_search_completed", True)
+        provider_request = event.get_extra("provider_request")
+        if provider_request is not None:
+            self._remove_meme_tool(provider_request)
+
+        context = self._resolve_runtime_pack_context(event=event)
+        pack_ids = context.get("pack_ids", [])
+
+        # 校验 pack_ids 与注入提示词前检查过的结果一致。
+        verified_ids = str(
+            event.get_extra("meme_manager_semantic_verified_pack_ids") or ""
+        )
+        if ",".join(pack_ids) != verified_ids:
+            return dumps_result({"ok": False, "reason": "当前语义图包已经变化"})
+
+        try:
+            # 分别解析提供方，因为各表情包可能使用不同的索引。
+            pack_contexts = []
+            for pack_id in pack_ids:
+                paths = get_pack_paths(pack_id)
+                pack_contexts.append(
+                    {"pack_id": pack_id, "pack_dir": paths["pack_dir"]}
+                )
+
+            result = await search_memes_multi_pack(
+                pack_contexts,
+                PLUGIN_DATA_DIR,
+                query,
+                self._resolve_embedding_provider,
+                top_k=self.semantic_top_k,
+                min_score=self.semantic_min_score,
+            )
+
+            records = candidate_records_multi_pack(
+                pack_contexts, result.get("candidates") or []
+            )
+            remember_candidates(event, records)
+            event.set_extra("meme_manager_semantic_query", str(query or ""))
+
+            return dumps_result(
+                {
+                    **result,
+                    "instruction": (
+                        "本轮搜索已完成。可从以下候选中选择符合表达意图的图片，也可以继续纯文字回复。"
+                        "发送具体图片时，使用选中候选的完整 ID。候选描述及标签作为选图参考数据。"
+                    ),
+                }
+            )
+        except Exception as exc:
+            logger.error("语义表情查询失败: %s", exc, exc_info=True)
+            return dumps_result({"ok": False, "reason": "语义查询失败"})
+
+    @llm_tool(name=PREVIEW_TOOL)
+    async def preview_memes_tool(
+        self, event: AstrMessageEvent, category: str, after: int = 0
+    ) -> CallToolResult | str:
+        """查看一个分类的编号缩略图，用于按画面挑选具体表情。
+
+        Args:
+            category(string): 可用分类键。
+            after(number): 起始编号游标。首次使用 0，翻页使用返回的 next_after。
+
+        Returns:
+            一张供模型选图的拼图。用 send_meme 的 preview:编号 发送原图。
+        """
+        run_context = event.get_extra("meme_manager_tool_context")
+        if (
+            run_context is None
+            or not self._scope_allows_llm_origin(event)
+            or not event.get_extra("meme_manager_preview_available")
+        ):
+            return dumps_result({"ok": False, "reason": "preview_unavailable"})
+        count = event.get_extra("meme_manager_preview_count") or 0
+        if count >= MAX_PREVIEW_PAGES:
+            return dumps_result({"ok": False, "reason": "preview_limit"})
+        if not isinstance(category, str) or type(after) is not int or after < 0:
+            return dumps_result({"ok": False, "reason": "invalid_preview_arguments"})
+        category = category.strip()
+        context = self._resolve_runtime_pack_context(event=event)
+        if category not in runtime_category_mapping(
+            context.get("category_mapping") or {}
+        ):
+            return dumps_result({"ok": False, "reason": "invalid_category"})
+        if event.get_extra("meme_manager_preview_busy") or (
+            event.get_extra("meme_manager_preview_candidates")
+            and not discard_meme_tool_context(run_context.messages, preview_only=True)
+        ):
+            return dumps_result({"ok": False, "reason": "preview_pending"})
+
+        event.set_extra("meme_manager_preview_candidates", None)
+        event.set_extra("meme_manager_preview_count", count + 1)
+        event.set_extra("meme_manager_preview_busy", True)
+        try:
+            files = self._get_category_meme_files(event, category)
+            jpeg, candidates, next_after = await asyncio.to_thread(
+                build_meme_preview,
+                PLUGIN_DATA_DIR / "preview_ids.sqlite3",
+                files,
+                context.get("pack_dirs") or {},
+                after,
+                self.preview_images_per_page,
+            )
+        except (OSError, sqlite3.Error):
+            logger.exception("[meme_manager] Failed to build a meme preview")
+            return dumps_result({"ok": False, "reason": "preview_failed"})
+        finally:
+            event.set_extra("meme_manager_preview_busy", False)
+        if jpeg is None:
+            return dumps_result({"ok": False, "reason": "no_preview_images"})
+        current = self._resolve_runtime_pack_context(event=event)
+        if context.get("pack_ids") != current.get("pack_ids"):
+            return dumps_result({"ok": False, "reason": "candidate_changed"})
+
+        event.set_extra(
+            "meme_manager_preview_candidates",
+            (context["pack_ids"], category, candidates),
+        )
+        result = {"numbers": list(candidates), "send_target": "preview:编号"}
+        if next_after is not None and count + 1 < MAX_PREVIEW_PAGES:
+            result["next_after"] = next_after
+        return CallToolResult(
+            content=[
+                TextContent(
+                    type="text",
+                    text=dumps_result(result)
+                    + "。拼图仅供选图。请用 send_meme 发送选中的原图。",
+                ),
+                ImageContent(
+                    type="image",
+                    data=base64.b64encode(jpeg).decode("ascii"),
+                    mimeType="image/jpeg",
+                ),
+            ]
+        )
+
+    @llm_tool(name="send_meme")
+    async def send_meme_tool(self, event: AstrMessageEvent, target: str) -> str:
+        """立即向当前聊天发送一张表情图片。
+
+        用户请求表情，或图片有助于表达回复时使用。
+        每次成功调用都会以独立消息发送一张图片。
+
+        分类目标会从该分类中随机选择一张图片。
+        图片 ID 会选择当前会话绑定表情包内的指定图片。
+        需要另一张图片时可再次调用。此工具独立于
+        自动附图的概率与数量限制。
+
+        Args:
+            target(string): 系统提示中可用的分类键、已知图片 ID，或
+                preview_memes 中选中的 preview:编号。
+
+        Returns:
+            平台适配器完成投递后，返回包含 ok=true、status=sent
+            及 sent_count=1 的 JSON。ok=false 时，reason 描述
+            结果；若包含 instruction，则给出下一步操作指引。
+        """
+        return await self._send_meme_tool_impl(event, target)
+
+    async def terminate(self):
+        if getattr(self, "manual_collect_manager", None):
+            await self.manual_collect_manager.close()
+        if getattr(self, "auto_collect_manager", None):
+            await self.auto_collect_manager.close()
+        if getattr(self, "decision_client", None):
+            await self.decision_client.close()
+        install_tasks = list(getattr(self, "_community_install_tasks", set()))
+        install_tasks.extend(getattr(self, "_community_update_tasks", set()))
+        for task in install_tasks:
+            task.cancel()
+        if install_tasks:
+            await asyncio.gather(*install_tasks, return_exceptions=True)
+        initial_task = getattr(self, "_semantic_initial_rebuild_task", None)
+        if initial_task and not initial_task.done():
+            initial_task.cancel()
+            await asyncio.gather(initial_task, return_exceptions=True)
+        if self.img_sync:
+            await asyncio.to_thread(self.img_sync.close)
+        sync_monitor = getattr(self, "_img_host_sync_monitor", None)
+        if sync_monitor:
+            await asyncio.gather(sync_monitor, return_exceptions=True)
+        if getattr(self, "semantic_task_manager", None):
+            await self.semantic_task_manager.close()
+        personas = self.context.provider_manager.personas
+        self._sync_persona_base_prompts(personas)
+        for index, persona in enumerate(personas):
+            key = self._get_persona_key(persona, index)
+            persona["prompt"] = self.persona_base_prompts[key]
